@@ -30,6 +30,23 @@ const JWT_SECRET = 'b2bpharma_secret_key';
 app.use(cors());
 app.use(express.json());
 
+// JWT Middleware
+const authenticate = (req, res, next) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ message: 'Unauthorized' });
+    try {
+        req.user = jwt.verify(token, JWT_SECRET);
+        next();
+    } catch {
+        res.status(401).json({ message: 'Invalid token' });
+    }
+};
+
+const authorizeDistributor = (req, res, next) => {
+    if (req.user.role !== 'distributor') return res.status(403).json({ message: 'Access denied' });
+    next();
+};
+
 const config = {
     user: 'sa',
     password: 'Gsquare@123',
@@ -53,6 +70,11 @@ sql.connect(config)
         IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='Users' AND COLUMN_NAME='role')
         ALTER TABLE Users ADD role NVARCHAR(20) NOT NULL DEFAULT 'retailer'
     `);
+    await sql.query(`
+        IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='Users' AND COLUMN_NAME='isApproved')
+        ALTER TABLE Users ADD isApproved BIT DEFAULT 0
+    `);
+    await sql.query(`UPDATE Users SET isApproved = 1 WHERE role = 'distributor'`);
     console.log('Users table ready');
 
     await sql.query(`
@@ -196,6 +218,10 @@ app.post('/login', async (req, res) => {
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) return res.status(400).json({ message: 'Invalid password' });
 
+        if (user.role === 'retailer' && !user.isApproved) {
+            return res.status(403).json({ message: 'Account pending approval from distributor' });
+        }
+
         const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '1d' });
         res.json({ token, role: user.role, name: user.fullName, id: user.id });
     } catch (err) {
@@ -203,13 +229,14 @@ app.post('/login', async (req, res) => {
     }
 });
 
-// Products with search and filter
+// Products with search and filter (expired blocked, FIFO order)
 app.get('/products', async (req, res) => {
     const { search, category } = req.query;
     try {
-        let query = 'SELECT * FROM Products WHERE 1=1';
+        let query = `SELECT * FROM Products WHERE 1=1 AND (expiryDate IS NULL OR expiryDate > GETDATE())`;
         if (search) query += ` AND productName LIKE '%${search}%'`;
         if (category) query += ` AND category = '${category}'`;
+        query += ` ORDER BY expiryDate ASC`;
         const result = await sql.query(query);
         res.json(result.recordset);
     } catch (err) {
@@ -334,8 +361,43 @@ app.put('/orders/:id/status', async (req, res) => {
     }
 });
 
+// Get All Retailers (Distributor)
+app.get('/retailers', authenticate, authorizeDistributor, async (req, res) => {
+    try {
+        const result = await sql.query(`SELECT id, fullName, email, isApproved, createdAt FROM Users WHERE role = 'retailer'`);
+        res.json(result.recordset);
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
+// Approve/Reject Retailer (Distributor)
+app.put('/retailers/:id/approve', authenticate, authorizeDistributor, async (req, res) => {
+    const { id } = req.params;
+    const { isApproved } = req.body;
+    try {
+        await sql.query`UPDATE Users SET isApproved = ${isApproved} WHERE id = ${id}`;
+        if (isApproved) {
+            const user = await sql.query`SELECT email, fullName FROM Users WHERE id = ${id}`;
+            await sendEmail(
+                user.recordset[0].email,
+                '✅ Account Approved - B2B Pharmacy',
+                `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+                    <h2 style="color:#52c41a;">Account Approved!</h2>
+                    <p>Dear <strong>${user.recordset[0].fullName}</strong>,</p>
+                    <p>Your retailer account has been approved. You can now login and place orders.</p>
+                    <p style="color:#1890ff;"><strong>B2B Pharmacy Team</strong></p>
+                </div>`
+            );
+        }
+        res.json({ message: isApproved ? 'Retailer approved' : 'Retailer rejected' });
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
 // Get All Orders (Distributor)
-app.get('/orders', async (req, res) => {
+app.get('/orders', authenticate, authorizeDistributor, async (req, res) => {
     try {
         const result = await sql.query(`
             SELECT o.id, o.quantity, o.totalPrice, o.status, o.createdAt,
@@ -371,7 +433,7 @@ app.get('/credit/:userId', async (req, res) => {
 });
 
 // Update Credit Limit (Distributor)
-app.put('/credit/:userId', async (req, res) => {
+app.put('/credit/:userId', authenticate, authorizeDistributor, async (req, res) => {
     const { userId } = req.params;
     const { creditLimit } = req.body;
     try {
@@ -388,7 +450,7 @@ app.put('/credit/:userId', async (req, res) => {
 });
 
 // Get All Retailers Credit (Distributor)
-app.get('/credits', async (req, res) => {
+app.get('/credits', authenticate, authorizeDistributor, async (req, res) => {
     try {
         const result = await sql.query(`
             SELECT u.id, u.fullName, u.email,
